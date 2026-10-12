@@ -1,0 +1,110 @@
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - revive
+    - gofumpt
+    - gosec
+    - bodyclose
+    - noctx
+    - contextcheck
+    - errorlint
+    - gocritic
+    - ineffassign
+    - unused
+    - depguard
+
+linters-settings:
+  depguard:
+    rules:
+      domain:
+        list-mode: lax
+        files:
+          - "**/internal/domain/**"
+        deny:
+          - pkg: "!$gostd"
+            desc: "domain layer must only use Go standard library"
+      app:
+        list-mode: lax
+        files:
+          - "**/internal/app/**"
+          - "**/internal/engine/**"
+        deny:
+          - pkg: "arus/internal/adapter/**"
+            desc: "app and engine layers are forbidden from importing adapter layer"
+      adapter-httpfetch:
+        list-mode: lax
+        files:
+          - "**/internal/adapter/httpfetch/**"
+        deny:
+          - pkg: "arus/internal/adapter/sqlite/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/fsx/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/ipcsrv/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/interceptor/**"
+            desc: "adapters must not import other adapters (except platform)"
+      adapter-sqlite:
+        list-mode: lax
+        files:
+          - "**/internal/adapter/sqlite/**"
+        deny:
+          - pkg: "arus/internal/adapter/httpfetch/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/fsx/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/ipcsrv/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/interceptor/**"
+            desc: "adapters must not import other adapters (except platform)"
+      adapter-fsx:
+        list-mode: lax
+        files:
+          - "**/internal/adapter/fsx/**"
+        deny:
+          - pkg: "arus/internal/adapter/httpfetch/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/sqlite/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/ipcsrv/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/interceptor/**"
+            desc: "adapters must not import other adapters (except platform)"
+      adapter-ipcsrv:
+        list-mode: lax
+        files:
+          - "**/internal/adapter/ipcsrv/**"
+        deny:
+          - pkg: "arus/internal/adapter/httpfetch/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/sqlite/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/fsx/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/interceptor/**"
+            desc: "adapters must not import other adapters (except platform)"
+      adapter-interceptor:
+        list-mode: lax
+        files:
+          - "**/internal/adapter/interceptor/**"
+        deny:
+          - pkg: "arus/internal/adapter/httpfetch/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/sqlite/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/fsx/**"
+            desc: "adapters must not import other adapters (except platform)"
+          - pkg: "arus/internal/adapter/ipcsrv/**"
+            desc: "adapters must not import other adapters (except platform)"
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
