@@ -38,6 +38,10 @@ type DownloadRepository interface {
 	// Get retrieves a download record by ID. Returns ErrNotFound if it does not exist.
 	Get(ctx context.Context, id domain.DownloadID) (domain.Download, error)
 
+	// Update updates persisted mutable fields of an existing download record.
+	// Returns ErrNotFound if the record does not exist.
+	Update(ctx context.Context, d domain.Download) error
+
 	// List queries download records matching the criteria in ListFilter.
 	List(ctx context.Context, f ListFilter) ([]domain.Download, error)
 

@@ -3,7 +3,9 @@ package fakes_test
 import (
 	"arus/internal/domain"
 	"arus/internal/testutil/fakes"
+	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 )
@@ -69,6 +71,15 @@ func TestFakeFileStore_MemFile_SparseAndFaults(t *testing.T) {
 	}
 	if err := memF.Close(); err != nil {
 		t.Errorf("Close() error: %v", err)
+	}
+	if err := memF.Close(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("second Close() should return os.ErrClosed, got: %v", err)
+	}
+	if _, err := memF.WriteAt([]byte("after-close"), 0); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("WriteAt after Close should return os.ErrClosed, got: %v", err)
+	}
+	if _, err := memF.ReadAt(make([]byte, 10), 0); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("ReadAt after Close should return os.ErrClosed, got: %v", err)
 	}
 
 	// Test Finalize with Rename conflict policy
@@ -140,6 +151,27 @@ func TestFakeClock_And_Timer(t *testing.T) {
 		t.Fatal("stopped timer should not fire")
 	default:
 	}
+
+	// Test immediate timer (d <= 0)
+	immediateTimer := clock.NewTimer(0)
+	select {
+	case tick := <-immediateTimer.C():
+		if !tick.Equal(clock.Now()) {
+			t.Errorf("immediate timer tick = %v, want %v", tick, clock.Now())
+		}
+	default:
+		t.Fatal("immediate timer should fire without Advance")
+	}
+
+	// Test Reset draining unconsumed tick
+	t3 := clock.NewTimer(1 * time.Second)
+	clock.Advance(1 * time.Second) // fires tick into t3.ch
+	t3.Reset(5 * time.Second)      // resets and drains unconsumed tick
+	select {
+	case <-t3.C():
+		t.Fatal("Reset should have drained unconsumed tick")
+	default:
+	}
 }
 
 func TestFakeEvents(t *testing.T) {
@@ -180,5 +212,76 @@ func TestSeqIDGen(t *testing.T) {
 	}
 	if string(id1) >= string(id2) {
 		t.Errorf("expected strictly monotonic IDs: id1=%q, id2=%q", id1, id2)
+	}
+}
+
+func TestFakeSettings(t *testing.T) {
+	ctx := context.Background()
+	settings := fakes.NewFakeSettings()
+
+	// Default fallback
+	if val, err := settings.GetInt(ctx, "max_conns", 4); err != nil || val != 4 {
+		t.Errorf("GetInt default got (%d, %v), want (4, nil)", val, err)
+	}
+
+	// Set and Get Int
+	if err := settings.SetInt(ctx, "max_conns", 16); err != nil {
+		t.Fatalf("SetInt error: %v", err)
+	}
+	if val, err := settings.GetInt(ctx, "max_conns", 4); err != nil || val != 16 {
+		t.Errorf("GetInt got (%d, %v), want (16, nil)", val, err)
+	}
+
+	// Set and Get Bool
+	if val, err := settings.GetBool(ctx, "motw", true); err != nil || !val {
+		t.Errorf("GetBool default got (%v, %v), want (true, nil)", val, err)
+	}
+	if err := settings.SetBool(ctx, "motw", false); err != nil {
+		t.Fatalf("SetBool error: %v", err)
+	}
+	if val, err := settings.GetBool(ctx, "motw", true); err != nil || val {
+		t.Errorf("GetBool got (%v, %v), want (false, nil)", val, err)
+	}
+
+	// String
+	if val, err := settings.GetString(ctx, "theme", "dark"); err != nil || val != "dark" {
+		t.Errorf("GetString default got (%q, %v), want ('dark', nil)", val, err)
+	}
+	if err := settings.Set(ctx, "theme", "light"); err != nil {
+		t.Fatalf("Set error: %v", err)
+	}
+	if val, err := settings.GetString(ctx, "theme", "dark"); err != nil || val != "light" {
+		t.Errorf("GetString got (%q, %v), want ('light', nil)", val, err)
+	}
+}
+
+func TestFakeSecretBox(t *testing.T) {
+	box := fakes.NewFakeSecretBox()
+
+	plain := []byte("session-cookie-secret-data")
+	sealed, err := box.Seal(plain)
+	if err != nil {
+		t.Fatalf("Seal error: %v", err)
+	}
+	if string(sealed) == string(plain) {
+		t.Errorf("sealed data should be obfuscated")
+	}
+
+	opened, err := box.Open(sealed)
+	if err != nil {
+		t.Fatalf("Open error: %v", err)
+	}
+	if string(opened) != string(plain) {
+		t.Errorf("Open got %q, want %q", string(opened), string(plain))
+	}
+
+	// Error injection
+	injected := errors.New("crypto failure")
+	box.SetError(injected)
+	if _, err := box.Seal(plain); !errors.Is(err, injected) {
+		t.Errorf("Seal with injected error got %v, want %v", err, injected)
+	}
+	if _, err := box.Open(sealed); !errors.Is(err, injected) {
+		t.Errorf("Open with injected error got %v, want %v", err, injected)
 	}
 }

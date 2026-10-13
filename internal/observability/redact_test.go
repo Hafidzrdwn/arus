@@ -67,6 +67,16 @@ func TestRedactURL(t *testing.T) {
 			input:    "https://example.com/file.bin?id=101&token=xyz789&verbose=true",
 			expected: "https://example.com/file.bin?id=101&token=[REDACTED]&verbose=true",
 		},
+		{
+			name:     "url with access_token and api_key params",
+			input:    "https://cdn.example.com/item.zip?access_token=tok123&api_key=key456&name=archive",
+			expected: "https://cdn.example.com/item.zip?access_token=[REDACTED]&api_key=[REDACTED]&name=archive",
+		},
+		{
+			name:     "url with password and secret params",
+			input:    "https://example.com/resource?user=alice&password=secretpass&client_secret=topsecret",
+			expected: "https://example.com/resource?user=alice&password=[REDACTED]&client_secret=[REDACTED]",
+		},
 	}
 
 	for _, tc := range tests {
@@ -124,12 +134,14 @@ func TestRedactHeaders(t *testing.T) {
 		{
 			name: "case insensitive header redaction",
 			input: http.Header{
-				"cookie":        []string{"secret_cookie"},
-				"AUTHORIZATION": []string{"Basic dXNlcjpwYXNz"},
-				"set-cookie":    []string{"token=123"},
+				"cookie":              []string{"secret_cookie"},
+				"AUTHORIZATION":       []string{"Basic dXNlcjpwYXNz"},
+				"set-cookie":          []string{"token=123"},
+				"Proxy-Authorization": []string{"Basic cHJveHk6cGFzcw=="},
+				"X-Api-Key":           []string{"apikey-12345"},
 			},
 			validate: func(t *testing.T, redacted http.Header) {
-				for _, k := range []string{"cookie", "AUTHORIZATION", "set-cookie"} {
+				for _, k := range []string{"cookie", "AUTHORIZATION", "set-cookie", "Proxy-Authorization", "X-Api-Key"} {
 					vals := redacted[k]
 					if len(vals) != 1 || vals[0] != "[REDACTED]" {
 						t.Errorf("expected header %q to be [REDACTED], got: %v", k, vals)

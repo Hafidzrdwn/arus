@@ -109,6 +109,46 @@ func RepoContractTest(t *testing.T, factory func() ports.DownloadRepository) {
 		}
 	})
 
+	t.Run("Update_Success", func(t *testing.T) {
+		repo := factory()
+		ctx := context.Background()
+
+		dl := newSampleDownload("01JUPDATE00000000000000001", "https://example.com/orig.zip", "orig.zip")
+		if err := repo.Create(ctx, dl); err != nil {
+			t.Fatalf("Create() error: %v", err)
+		}
+
+		dl.FileName = "updated.zip"
+		dl.TotalSize = 999999
+		dl.FinalURL = "https://cdn.example.com/updated.zip"
+		dl.Validators = domain.Validators{ETag: `"etag-1234"`}
+		dl.Opts.MaxConns = 16
+
+		if err := repo.Update(ctx, dl); err != nil {
+			t.Fatalf("Update() error: %v", err)
+		}
+
+		got, err := repo.Get(ctx, dl.ID)
+		if err != nil {
+			t.Fatalf("Get() error: %v", err)
+		}
+		if got.FileName != "updated.zip" {
+			t.Errorf("FileName = %q, want 'updated.zip'", got.FileName)
+		}
+		if got.TotalSize != 999999 {
+			t.Errorf("TotalSize = %d, want 999999", got.TotalSize)
+		}
+		if got.FinalURL != "https://cdn.example.com/updated.zip" {
+			t.Errorf("FinalURL = %q, want 'https://cdn.example.com/updated.zip'", got.FinalURL)
+		}
+		if got.Validators.ETag != `"etag-1234"` {
+			t.Errorf("Validators.ETag = %q, want '\"etag-1234\"'", got.Validators.ETag)
+		}
+		if got.Opts.MaxConns != 16 {
+			t.Errorf("Opts.MaxConns = %d, want 16", got.Opts.MaxConns)
+		}
+	})
+
 	t.Run("NotFound_Operations", func(t *testing.T) {
 		repo := factory()
 		ctx := context.Background()
@@ -116,6 +156,9 @@ func RepoContractTest(t *testing.T, factory func() ports.DownloadRepository) {
 
 		if _, err := repo.Get(ctx, nonExistent); !errors.Is(err, ports.ErrNotFound) {
 			t.Errorf("Get(nonExistent) err = %v, want ErrNotFound", err)
+		}
+		if err := repo.Update(ctx, domain.Download{ID: nonExistent}); !errors.Is(err, ports.ErrNotFound) {
+			t.Errorf("Update(nonExistent) err = %v, want ErrNotFound", err)
 		}
 		if err := repo.UpdateState(ctx, nonExistent, domain.StateDownloading, nil); !errors.Is(err, ports.ErrNotFound) {
 			t.Errorf("UpdateState(nonExistent) err = %v, want ErrNotFound", err)

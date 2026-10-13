@@ -51,6 +51,18 @@ func (r *FakeRepo) Get(_ context.Context, id domain.DownloadID) (domain.Download
 	return cloneDownload(d), nil
 }
 
+// Update updates persisted mutable fields of an existing download record.
+func (r *FakeRepo) Update(_ context.Context, d domain.Download) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, exists := r.downloads[d.ID]; !exists {
+		return ports.ErrNotFound
+	}
+	r.downloads[d.ID] = cloneDownload(d)
+	return nil
+}
+
 // List queries download records matching the criteria in ListFilter.
 func (r *FakeRepo) List(_ context.Context, f ports.ListFilter) ([]domain.Download, error) {
 	r.mu.RLock()
@@ -59,7 +71,6 @@ func (r *FakeRepo) List(_ context.Context, f ports.ListFilter) ([]domain.Downloa
 	var results []domain.Download
 
 	for _, d := range r.downloads {
-		// Filter by States
 		if len(f.States) > 0 {
 			stateMatched := false
 			for _, st := range f.States {
@@ -73,17 +84,14 @@ func (r *FakeRepo) List(_ context.Context, f ports.ListFilter) ([]domain.Downloa
 			}
 		}
 
-		// Filter by Category
 		if f.Category != "" && d.Opts.Category != f.Category {
 			continue
 		}
 
-		// Filter by QueueID
 		if f.QueueID != "" && d.Opts.QueueID != f.QueueID {
 			continue
 		}
 
-		// Filter by Search (substring matching on URL or FileName)
 		if f.Search != "" {
 			if !strings.Contains(d.URL, f.Search) && !strings.Contains(d.FileName, f.Search) {
 				continue
@@ -93,7 +101,6 @@ func (r *FakeRepo) List(_ context.Context, f ports.ListFilter) ([]domain.Downloa
 		results = append(results, cloneDownload(d))
 	}
 
-	// Sort deterministically: descending CreatedAt, then ascending ID
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].CreatedAt.Equal(results[j].CreatedAt) {
 			return results[i].ID < results[j].ID

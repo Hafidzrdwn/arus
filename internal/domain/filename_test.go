@@ -37,6 +37,11 @@ func TestSanitizeFileName(t *testing.T) {
 			expected: "_com1.tar.gz",
 		},
 		{
+			name:     "Windows reserved clock$",
+			input:    "clock$.dat",
+			expected: "_clock$.dat",
+		},
+		{
 			name:     "Bidi override RLO character",
 			input:    "a\u202Eb.exe",
 			expected: "ab.exe",

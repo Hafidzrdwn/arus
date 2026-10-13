@@ -50,6 +50,12 @@ func (t *FakeTimer) Reset(d time.Duration) bool {
 	t.active = true
 	t.deadline = t.clock.now.Add(d)
 
+	// Drain stale unread tick if any
+	select {
+	case <-t.ch:
+	default:
+	}
+
 	found := false
 	for _, cur := range t.clock.timers {
 		if cur == t {
@@ -94,9 +100,13 @@ func (c *FakeClock) NewTimer(d time.Duration) ports.Timer {
 		clock:    c,
 		deadline: c.now.Add(d),
 		ch:       make(chan time.Time, 1),
-		active:   true,
+		active:   d > 0,
 	}
-	c.timers = append(c.timers, t)
+	if d <= 0 {
+		t.ch <- c.now
+	} else {
+		c.timers = append(c.timers, t)
+	}
 	return t
 }
 

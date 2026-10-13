@@ -5,6 +5,7 @@ import (
 	"arus/internal/domain"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,7 +37,7 @@ func (f *MemFile) WriteAt(p []byte, off int64) (int, error) {
 	defer f.mu.Unlock()
 
 	if f.closed {
-		return 0, errors.New("file closed")
+		return 0, os.ErrClosed
 	}
 	if f.writeErr != nil {
 		return 0, f.writeErr
@@ -79,10 +80,10 @@ func (f *MemFile) ReadAt(p []byte, off int64) (int, error) {
 	defer f.mu.RUnlock()
 
 	if f.closed {
-		return 0, errors.New("file closed")
+		return 0, os.ErrClosed
 	}
 	if off >= f.size {
-		return 0, os.ErrNotExist
+		return 0, io.EOF
 	}
 
 	totalRead := 0
@@ -106,7 +107,6 @@ func (f *MemFile) ReadAt(p []byte, off int64) (int, error) {
 		if exists {
 			copy(p[totalRead:totalRead+int(chunkLen)], block[blockOff:])
 		} else {
-			// Sparse hole: zeros
 			for i := 0; i < int(chunkLen); i++ {
 				p[totalRead+i] = 0
 			}
@@ -114,6 +114,9 @@ func (f *MemFile) ReadAt(p []byte, off int64) (int, error) {
 		totalRead += int(chunkLen)
 	}
 
+	if totalRead < len(p) {
+		return totalRead, io.EOF
+	}
 	return totalRead, nil
 }
 
@@ -123,7 +126,7 @@ func (f *MemFile) Sync() error {
 	defer f.mu.RUnlock()
 
 	if f.closed {
-		return errors.New("file closed")
+		return os.ErrClosed
 	}
 	if f.syncErr != nil {
 		return f.syncErr
@@ -137,7 +140,7 @@ func (f *MemFile) Close() error {
 	defer f.mu.Unlock()
 
 	if f.closed {
-		return errors.New("file already closed")
+		return os.ErrClosed
 	}
 	f.closed = true
 	return nil
@@ -237,9 +240,7 @@ func (s *FakeFileStore) Finalize(partPath, finalPath string, policy domain.Confl
 	if _, collision := s.files[targetPath]; collision {
 		switch policy {
 		case domain.ConflictPolicyOverwrite:
-			// Overwrite in place
 		case domain.ConflictPolicyRename:
-			// Generate non-colliding name (1), (2), etc.
 			dir := filepath.Dir(cleanFinal)
 			base := filepath.Base(cleanFinal)
 			ext := filepath.Ext(base)

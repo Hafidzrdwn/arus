@@ -9,19 +9,34 @@ import (
 // RedactionPlaceholder is the masking replacement used for sensitive values.
 const RedactionPlaceholder = "[REDACTED]"
 
-// isSensitiveQueryKey checks if a query parameter key matches sensitive patterns:
-// token, sig, signature, key, auth, or x-amz-* (case-insensitive).
 func isSensitiveQueryKey(key string) bool {
 	lower := strings.ToLower(strings.TrimSpace(key))
 	switch lower {
-	case "token", "sig", "signature", "key", "auth":
+	case "token", "sig", "signature", "key", "auth", "secret", "password", "pwd", "credential":
 		return true
 	}
-	return strings.HasPrefix(lower, "x-amz-")
+	if strings.HasPrefix(lower, "x-amz-") {
+		return true
+	}
+	if strings.HasSuffix(lower, "token") || strings.HasSuffix(lower, "_token") || strings.HasSuffix(lower, "-token") {
+		return true
+	}
+	if strings.HasSuffix(lower, "key") || strings.HasSuffix(lower, "_key") || strings.HasSuffix(lower, "-key") {
+		return true
+	}
+	if strings.HasSuffix(lower, "secret") || strings.HasSuffix(lower, "_secret") {
+		return true
+	}
+	if strings.HasSuffix(lower, "signature") || strings.HasSuffix(lower, "_sig") || strings.HasSuffix(lower, "-sig") {
+		return true
+	}
+	if strings.HasPrefix(lower, "api_") || strings.HasPrefix(lower, "auth_") {
+		return true
+	}
+	return false
 }
 
-// RedactURL masks sensitive query parameter values (token, sig, signature, key,
-// auth, x-amz-*) with "[REDACTED]". URLs without a query string are returned unmodified.
+// RedactURL masks sensitive query parameter values with "[REDACTED]".
 func RedactURL(rawURL string) string {
 	if rawURL == "" {
 		return ""
@@ -32,7 +47,6 @@ func RedactURL(rawURL string) string {
 		return rawURL
 	}
 
-	// Split by '&' to preserve the original order of query parameters.
 	params := strings.Split(u.RawQuery, "&")
 	modified := false
 	for i, param := range params {
@@ -59,19 +73,19 @@ func RedactURL(rawURL string) string {
 	return u.String()
 }
 
-// isSensitiveHeader returns true for sensitive HTTP headers: Cookie, Authorization, Set-Cookie.
 func isSensitiveHeader(key string) bool {
 	lower := strings.ToLower(strings.TrimSpace(key))
 	switch lower {
-	case "cookie", "authorization", "set-cookie":
+	case "cookie", "set-cookie", "authorization", "proxy-authorization", "x-api-key", "x-auth-token":
 		return true
-	default:
-		return false
 	}
+	if strings.Contains(lower, "authorization") || strings.HasPrefix(lower, "x-auth") || strings.HasPrefix(lower, "x-api-key") || strings.HasSuffix(lower, "-token") {
+		return true
+	}
+	return false
 }
 
-// RedactHeaders returns a deep clone of the given http.Header with sensitive headers
-// (Cookie, Authorization, Set-Cookie) masked with "[REDACTED]".
+// RedactHeaders returns a copy of h with sensitive authentication headers masked with "[REDACTED]".
 func RedactHeaders(h http.Header) http.Header {
 	if h == nil {
 		return nil
