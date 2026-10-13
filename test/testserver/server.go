@@ -110,7 +110,11 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	defer s.stats.releaseConn()
 
 	if s.cfg.latency > 0 {
-		time.Sleep(s.cfg.latency)
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(s.cfg.latency):
+		}
 	}
 
 	if s.cfg.maxConns > 0 {
