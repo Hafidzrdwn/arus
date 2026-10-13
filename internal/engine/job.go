@@ -172,13 +172,14 @@ func (j *Job) Pause() []domain.Segment {
 
 	j.stateMu.Lock()
 	cancel := j.cancelFunc
+	file := j.file
 	j.stateMu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
-	if j.file != nil {
-		_ = j.file.Sync()
+	if file != nil {
+		_ = file.Sync()
 	}
 	return j.Snapshot().Segments
 }
@@ -277,9 +278,14 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 			return Result{}, fmt.Errorf("file allocation failed: %w", err)
 		}
 	}
+	j.stateMu.Lock()
 	j.file = file
+	j.stateMu.Unlock()
 	defer func() {
 		_ = file.Close()
+		j.stateMu.Lock()
+		j.file = nil
+		j.stateMu.Unlock()
 	}()
 
 	isSingleStream := false
@@ -688,9 +694,6 @@ func (j *Job) SetTargetConns(n int) {
 		toRetire := activeCount - n
 		for i := len(activeWorkers) - 1; i >= 0 && toRetire > 0; i-- {
 			activeWorkers[i].retire.Store(true)
-			if activeWorkers[i].cancel != nil {
-				activeWorkers[i].cancel()
-			}
 			toRetire--
 		}
 	}

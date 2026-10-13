@@ -120,6 +120,12 @@ func TestStateTransitions_Valid(t *testing.T) {
 			expectedState: domain.StateCancelled,
 		},
 		{
+			name:          "Paused -> Probing on RefreshLink",
+			initialState:  domain.StatePaused,
+			event:         domain.RefreshLink{},
+			expectedState: domain.StateProbing,
+		},
+		{
 			name:          "Paused -> Failed on Fatal",
 			initialState:  domain.StatePaused,
 			event:         domain.Fatal{Err: sampleErr},

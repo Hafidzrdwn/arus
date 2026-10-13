@@ -162,6 +162,10 @@ func (d *Download) Transition(ev Event) error {
 		case Resume:
 			d.State = StateQueued
 			return nil
+		case RefreshLink:
+			d.State = StateProbing
+			d.Err = nil
+			return nil
 		case Cancel:
 			d.State = StateCancelled
 			return nil

@@ -194,6 +194,12 @@ func (r *Registry) Orphan(seg *SegState) {
 	}
 	seg.active.Store(false)
 	r.mu.Lock()
+	for _, o := range r.orphans {
+		if o == seg {
+			r.mu.Unlock()
+			return
+		}
+	}
 	r.orphans = append(r.orphans, seg)
 	cp := r.checkpointer
 	r.mu.Unlock()

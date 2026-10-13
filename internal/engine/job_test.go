@@ -297,13 +297,19 @@ func TestJob_Pause_SnapshotConsistent_NoGoleak(t *testing.T) {
 		FileStore: store,
 	}, dl)
 
+	stateCh := job.OnStateChan()
+
 	runErrCh := make(chan error, 1)
 	go func() {
 		_, err := job.Run(context.Background())
 		runErrCh <- err
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	for st := range stateCh {
+		if st == domain.StateDownloading {
+			break
+		}
+	}
 
 	pausedSegs := job.Pause()
 	if len(pausedSegs) == 0 {
@@ -326,4 +332,61 @@ func TestJob_Pause_SnapshotConsistent_NoGoleak(t *testing.T) {
 
 	ts.Close()
 	goleak.VerifyNone(t)
+}
+
+func TestJob_SetTargetConns_RetireGraceful(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	const size = 16 * 1024 * 1024
+	const seed = 42
+	ts := testserver.New(
+		t,
+		testserver.WithSize(size),
+		testserver.WithSeed(seed),
+	)
+	defer ts.Close()
+
+	store := fsx.New()
+	fetcher := mustNewFetcher(t, httpfetch.FetcherConfig{MaxRedirects: 5})
+
+	tempDir := t.TempDir()
+	partPath := filepath.Join(tempDir, "retire.arus-part")
+
+	dl := domain.Download{
+		ID:       "dl-retire",
+		URL:      ts.URL,
+		PartPath: partPath,
+		Opts:     domain.Options{MaxConns: 4},
+	}
+
+	job := engine.NewJob(engine.JobDeps{
+		Fetcher:   fetcher,
+		FileStore: store,
+	}, dl)
+
+	stateCh := job.OnStateChan()
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		_, err := job.Run(context.Background())
+		runErrCh <- err
+	}()
+
+	for st := range stateCh {
+		if st == domain.StateDownloading {
+			break
+		}
+	}
+
+	job.SetTargetConns(2)
+	if target := job.TargetConns(); target != 2 {
+		t.Errorf("TargetConns = %d, want 2", target)
+	}
+
+	runErr := <-runErrCh
+	if runErr != nil {
+		t.Fatalf("job.Run failed: %v", runErr)
+	}
+
+	_ = job.Pause()
 }

@@ -488,3 +488,21 @@ func TestJob_SetTargetConns_DynamicRetireAndSpawn(t *testing.T) {
 		t.Fatalf("hash mismatch: got %s, want %s", gotHash, wantHash)
 	}
 }
+
+func TestRegistry_OrphanDeduplication(t *testing.T) {
+	seg := engine.NewSegState("seg-dup", 0, 1000, 100)
+	reg := engine.NewRegistry(nil, nil)
+
+	reg.Orphan(seg)
+	reg.Orphan(seg)
+
+	claimed, ok := reg.Claim("w1")
+	if !ok || claimed != seg {
+		t.Fatalf("expected to claim seg, got %v (ok=%v)", claimed, ok)
+	}
+
+	claimed2, ok2 := reg.Claim("w2")
+	if ok2 {
+		t.Fatalf("expected second claim to fail, but got %v", claimed2)
+	}
+}

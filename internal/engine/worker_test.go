@@ -412,7 +412,9 @@ func TestWorker_ContextCancel_FastExit_NoLeak(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
-		time.Sleep(50 * time.Millisecond)
+		for seg.Cursor.Load() == 0 && ctx.Err() == nil {
+			time.Sleep(2 * time.Millisecond)
+		}
 		cancel()
 	}()
 
