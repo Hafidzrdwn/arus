@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -35,6 +36,7 @@ type WorkerDeps struct {
 	Clock          ports.Clock
 	RNG            func() float64
 	Progress       *atomic.Int64
+	Retries        *atomic.Int64
 }
 
 // RunSegment downloads a discrete byte range from the remote server and writes it directly to disk.
@@ -73,6 +75,9 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 				expiredRetries++
 			}
 			attempt++
+			if deps.Retries != nil {
+				deps.Retries.Add(1)
+			}
 			if attempt >= maxAttempts {
 				return fmt.Errorf("segment %s failed after %d attempts: %w", seg.ID, attempt, err)
 			}
@@ -107,6 +112,9 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 			}
 			expiredRetries++
 			attempt++
+			if deps.Retries != nil {
+				deps.Retries.Add(1)
+			}
 			delay := CalculateBackoff(attempt, resp.RetryAfter, deps.RNG)
 			if serr := Sleep(ctx, deps.Clock, delay); serr != nil {
 				return serr
@@ -120,6 +128,9 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 			}
 
 			attempt++
+			if deps.Retries != nil {
+				deps.Retries.Add(1)
+			}
 			if attempt >= maxAttempts {
 				return fmt.Errorf("segment %s failed after %d attempts (status %d)", seg.ID, attempt, resp.Status)
 			}
@@ -165,6 +176,9 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 			}
 
 			if rerr != nil {
+				if rerr == io.EOF && seg.End.Load() == math.MaxInt64 {
+					seg.End.Store(pos)
+				}
 				break
 			}
 		}
@@ -179,6 +193,9 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 			attempt = 0
 		} else {
 			attempt++
+			if deps.Retries != nil {
+				deps.Retries.Add(1)
+			}
 		}
 
 		if attempt >= maxAttempts {

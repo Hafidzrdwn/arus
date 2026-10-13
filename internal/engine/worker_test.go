@@ -29,7 +29,7 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-func mustNewFetcher(t *testing.T, cfg httpfetch.FetcherConfig) ports.Fetcher {
+func mustNewFetcher(t testing.TB, cfg httpfetch.FetcherConfig) ports.Fetcher {
 	t.Helper()
 	f, err := httpfetch.NewFetcher(cfg)
 	if err != nil {
