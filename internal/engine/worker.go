@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -45,6 +47,20 @@ type WorkerDeps struct {
 	Retries        *atomic.Int64
 	Retire         *atomic.Bool
 	Limiter        *LimiterSet
+	ErrTracker     *ErrorTracker
+}
+
+func recordNetError(tracker *ErrorTracker, err error) {
+	if tracker == nil || err == nil {
+		return
+	}
+	var netErr net.Error
+	msg := strings.ToLower(err.Error())
+	if (errors.As(err, &netErr) && netErr.Timeout()) || strings.Contains(msg, "timeout") {
+		tracker.RecordTimeout()
+	} else if strings.Contains(msg, "reset") || strings.Contains(msg, "broken pipe") || strings.Contains(msg, "connection refused") || strings.Contains(msg, "unexpected eof") {
+		tracker.RecordReset()
+	}
 }
 
 // RunSegment downloads a discrete byte range from the remote server and writes it directly to disk.
@@ -72,6 +88,7 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 
 		resp, err := deps.Fetcher.OpenRange(ctx, deps.RequestContext, deps.URL, pos, end-1, deps.Validator)
 		if err != nil {
+			recordNetError(deps.ErrTracker, err)
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -113,6 +130,34 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 				_ = resp.Body.Close()
 				return fmt.Errorf("range mismatch: expected start %d, got %d", pos, resp.ContentRange.Start)
 			}
+		case resp.Status == http.StatusTooManyRequests:
+			if deps.ErrTracker != nil {
+				deps.ErrTracker.Record429(resp.RetryAfter)
+			}
+			_ = resp.Body.Close()
+			attempt++
+			if deps.Retries != nil {
+				deps.Retries.Add(1)
+			}
+			delay := CalculateBackoff(attempt, resp.RetryAfter, deps.RNG)
+			if serr := Sleep(ctx, deps.Clock, delay); serr != nil {
+				return serr
+			}
+			continue
+		case resp.Status == http.StatusServiceUnavailable:
+			if deps.ErrTracker != nil {
+				deps.ErrTracker.Record503(resp.RetryAfter)
+			}
+			_ = resp.Body.Close()
+			attempt++
+			if deps.Retries != nil {
+				deps.Retries.Add(1)
+			}
+			delay := CalculateBackoff(attempt, resp.RetryAfter, deps.RNG)
+			if serr := Sleep(ctx, deps.Clock, delay); serr != nil {
+				return serr
+			}
+			continue
 		case resp.Status == http.StatusNotFound:
 			_ = resp.Body.Close()
 			return domain.NewDownloadError(domain.ErrCodeNotFound, "server returned 404 Not Found", false)
@@ -204,6 +249,9 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 			if rerr != nil {
 				if rerr == io.EOF && seg.End.Load() == math.MaxInt64 {
 					seg.End.Store(pos)
+				}
+				if rerr != io.EOF && deps.ErrTracker != nil {
+					recordNetError(deps.ErrTracker, rerr)
 				}
 				break
 			}

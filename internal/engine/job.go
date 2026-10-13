@@ -25,6 +25,10 @@ type JobDeps struct {
 	Clock         ports.Clock
 	RNG           func() float64
 	GlobalLimiter *Throttle
+	HostProfiles  *HostProfiles
+	ConnBudget    *ConnBudget
+	TunerInterval time.Duration
+	TunerConfig   *TunerConfig
 }
 
 // Result summarizes execution metrics of a download job.
@@ -44,6 +48,7 @@ type JobSnapshot struct {
 type workerHandle struct {
 	id     string
 	retire atomic.Bool
+	cancel context.CancelFunc
 }
 
 // Job orchestrates probing, allocation, segment planning, and worker lifecycles.
@@ -78,6 +83,8 @@ type Job struct {
 	retries        atomic.Int64
 	file           ports.File
 	limiter        *LimiterSet
+	errTracker     *ErrorTracker
+	budgetConns    int
 }
 
 // NewJob creates an initialized download Job for the given download entity.
@@ -86,12 +93,13 @@ func NewJob(deps JobDeps, download domain.Download) *Job {
 	limiterSet := NewLimiterSet(deps.GlobalLimiter, jobThrottle)
 
 	return &Job{
-		deps:      deps,
-		download:  download,
-		state:     domain.StateQueued,
-		progress:  NewProgressTracker(download.TotalSize, deps.Clock),
-		onStateCh: make(chan domain.State, 16),
-		limiter:   limiterSet,
+		deps:       deps,
+		download:   download,
+		state:      domain.StateQueued,
+		progress:   NewProgressTracker(download.TotalSize, deps.Clock),
+		onStateCh:  make(chan domain.State, 16),
+		limiter:    limiterSet,
+		errTracker: &ErrorTracker{},
 	}
 }
 
@@ -255,6 +263,13 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 		if maxConns <= 0 {
 			maxConns = 4
 		}
+		if j.deps.HostProfiles != nil {
+			host := cleanHostString(j.download.URL)
+			safe := j.deps.HostProfiles.SafeMaxConns(host)
+			if safe > 0 && maxConns > safe {
+				maxConns = safe
+			}
+		}
 
 		planned := domain.PlanSegments(j.download.TotalSize, int64(maxConns), 1048576, 4096)
 		segs = make([]*SegState, len(planned))
@@ -316,10 +331,39 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 			if maxConns <= 0 {
 				maxConns = 4
 			}
+			host := cleanHostString(j.download.URL)
+			safeMax := 32
+			if j.deps.HostProfiles != nil {
+				safeMax = j.deps.HostProfiles.SafeMaxConns(host)
+				if safeMax > 0 && maxConns > safeMax {
+					maxConns = safeMax
+				}
+			}
 			if numWorkers > maxConns {
 				numWorkers = maxConns
 			}
+			if j.deps.ConnBudget != nil {
+				numWorkers = j.deps.ConnBudget.TryAcquire(host, 0, numWorkers, safeMax)
+				if numWorkers < 1 {
+					numWorkers = 1
+				}
+			}
+			j.workerMu.Lock()
+			j.budgetConns = numWorkers
+			j.workerMu.Unlock()
 		}
+
+		defer func() {
+			j.workerMu.Lock()
+			bConns := j.budgetConns
+			j.budgetConns = 0
+			j.workerMu.Unlock()
+
+			if j.deps.ConnBudget != nil && bConns > 0 {
+				host := cleanHostString(j.download.URL)
+				j.deps.ConnBudget.Release(host, bConns)
+			}
+		}()
 
 		j.workerMu.Lock()
 		j.workerCtx = workerCtx
@@ -337,7 +381,13 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 		}
 		j.workerMu.Unlock()
 
+		tunerStopCh := make(chan struct{})
+		if !isSingleStream {
+			go j.runTuner(workerCtx, tunerStopCh, numWorkers)
+		}
+
 		j.workerWG.Wait()
+		close(tunerStopCh)
 
 		j.workerMu.Lock()
 		j.done = true
@@ -440,6 +490,11 @@ func (j *Job) streamResponseDirect(ctx context.Context, body io.Reader, seg *Seg
 }
 
 func (j *Job) runWorker(ctx context.Context, h *workerHandle) {
+	wCtx, wCancel := context.WithCancel(ctx)
+	j.workerMu.Lock()
+	h.cancel = wCancel
+	j.workerMu.Unlock()
+	defer wCancel()
 	defer j.workerWG.Done()
 	defer j.removeWorker(h)
 
@@ -450,7 +505,17 @@ func (j *Job) runWorker(ctx context.Context, h *workerHandle) {
 
 		seg, ok := j.registry.Claim(h.id)
 		if !ok {
-			return
+			if j.registry.IsComplete() {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-j.registry.NotifyChan():
+				continue
+			case <-time.After(20 * time.Millisecond):
+				continue
+			}
 		}
 
 		wDeps := WorkerDeps{
@@ -465,11 +530,12 @@ func (j *Job) runWorker(ctx context.Context, h *workerHandle) {
 			Retries:        &j.retries,
 			Retire:         &h.retire,
 			Limiter:        j.limiter,
+			ErrTracker:     j.errTracker,
 		}
 
-		werr := RunSegment(ctx, wDeps, seg)
+		werr := RunSegment(wCtx, wDeps, seg)
 		if werr != nil {
-			if errors.Is(werr, ErrWorkerRetired) {
+			if errors.Is(werr, ErrWorkerRetired) || h.retire.Load() {
 				j.registry.Orphan(seg)
 				return
 			}
@@ -521,8 +587,22 @@ func (j *Job) SetTargetConns(n int) {
 		n = 32
 	}
 
+	host := cleanHostString(j.download.URL)
+	safeMax := 32
+	if j.deps.HostProfiles != nil {
+		safeMax = j.deps.HostProfiles.SafeMaxConns(host)
+		if safeMax > 0 && n > safeMax {
+			n = safeMax
+		}
+	}
+
 	j.workerMu.Lock()
 	defer j.workerMu.Unlock()
+
+	if j.deps.ConnBudget != nil {
+		n = j.deps.ConnBudget.TryAcquire(host, j.budgetConns, n, safeMax)
+		j.budgetConns = n
+	}
 
 	j.targetConns = n
 
@@ -551,7 +631,121 @@ func (j *Job) SetTargetConns(n int) {
 		toRetire := activeCount - n
 		for i := len(activeWorkers) - 1; i >= 0 && toRetire > 0; i-- {
 			activeWorkers[i].retire.Store(true)
+			if activeWorkers[i].cancel != nil {
+				activeWorkers[i].cancel()
+			}
 			toRetire--
+		}
+	}
+}
+
+// TargetConns returns the desired number of worker connections configured for the job.
+func (j *Job) TargetConns() int {
+	j.workerMu.Lock()
+	defer j.workerMu.Unlock()
+	return j.targetConns
+}
+
+// ActiveConns returns the number of active, non-retired worker connections.
+func (j *Job) ActiveConns() int {
+	j.workerMu.Lock()
+	defer j.workerMu.Unlock()
+	count := 0
+	for _, w := range j.workers {
+		if !w.retire.Load() {
+			count++
+		}
+	}
+	return count
+}
+
+// ErrTracker returns the job's ErrorTracker.
+func (j *Job) ErrTracker() *ErrorTracker {
+	return j.errTracker
+}
+
+func (j *Job) runTuner(ctx context.Context, stopCh <-chan struct{}, initialConns int) {
+	interval := j.deps.TunerInterval
+	if interval <= 0 {
+		interval = 4 * time.Second
+	}
+
+	cfg := DefaultTunerConfig()
+	if j.deps.TunerConfig != nil {
+		cfg = *j.deps.TunerConfig
+	}
+	if j.download.Opts.MaxConns > 0 {
+		cfg.MaxConnsPerJob = j.download.Opts.MaxConns
+	}
+
+	host := cleanHostString(j.download.URL)
+	if j.deps.HostProfiles != nil {
+		safe := j.deps.HostProfiles.SafeMaxConns(host)
+		if safe > 0 && cfg.MaxConnsPerJob > safe {
+			cfg.MaxConnsPerJob = safe
+		}
+	}
+
+	state := NewTunerState(cfg, initialConns)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-stopCh:
+			return
+		case <-ticker.C:
+		}
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		active := j.ActiveConns()
+		if active == 0 {
+			continue
+		}
+
+		if j.deps.HostProfiles != nil {
+			safe := j.deps.HostProfiles.SafeMaxConns(host)
+			if safe > 0 && state.Config.MaxConnsPerJob > safe {
+				state.Config.MaxConnsPerJob = safe
+			}
+		}
+
+		errWin, retryAfter := j.errTracker.Drain()
+		speed := float64(j.progress.Speed1s())
+
+		sample := Sample{
+			ThroughputEMA: speed,
+			Conns:         active,
+			ErrWindow:     errWin,
+			RetryAfter:    retryAfter,
+		}
+
+		nextState, action := Decide(j.now(), state, sample)
+		state = nextState
+
+		if action.Kind == ActionHalveAndWait || errWin.Status429 > 0 {
+			if j.deps.HostProfiles != nil {
+				j.deps.HostProfiles.Learn429(host, active)
+			}
+		}
+
+		if action.TargetConns != active {
+			j.SetTargetConns(action.TargetConns)
+		}
+
+		if action.Wait > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stopCh:
+				return
+			case <-time.After(action.Wait):
+			}
 		}
 	}
 }

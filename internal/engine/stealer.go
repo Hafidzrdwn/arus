@@ -29,6 +29,7 @@ type Checkpointer interface {
 // Registry coordinates dynamic segment state, work-stealing, and orphan queues.
 type Registry struct {
 	mu           sync.RWMutex
+	notifyCh     chan struct{}
 	segments     []*SegState
 	orphans      []*SegState
 	checkpointer Checkpointer
@@ -40,6 +41,7 @@ type Registry struct {
 // NewRegistry constructs an initialized Registry for planned segments.
 func NewRegistry(initial []*SegState, cp Checkpointer) *Registry {
 	r := &Registry{
+		notifyCh:     make(chan struct{}, 16),
 		segments:     make([]*SegState, len(initial)),
 		orphans:      make([]*SegState, len(initial)),
 		checkpointer: cp,
@@ -161,6 +163,30 @@ func (r *Registry) steal(_ string) (*SegState, bool) {
 	}
 }
 
+func (r *Registry) notify() {
+	select {
+	case r.notifyCh <- struct{}{}:
+	default:
+	}
+}
+
+// NotifyChan returns a channel signaled when segments are orphaned or released.
+func (r *Registry) NotifyChan() <-chan struct{} {
+	return r.notifyCh
+}
+
+// IsComplete returns true if all segments in the registry have been fully downloaded.
+func (r *Registry) IsComplete() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, s := range r.segments {
+		if !s.IsComplete() {
+			return false
+		}
+	}
+	return true
+}
+
 // Orphan returns an unfinished segment to the orphan queue.
 func (r *Registry) Orphan(seg *SegState) {
 	if seg == nil || seg.IsComplete() {
@@ -172,6 +198,8 @@ func (r *Registry) Orphan(seg *SegState) {
 	cp := r.checkpointer
 	r.mu.Unlock()
 
+	r.notify()
+
 	if cp != nil {
 		cp.MarkDirty()
 	}
@@ -182,6 +210,7 @@ func (r *Registry) Release(seg *SegState) {
 	if seg != nil {
 		seg.active.Store(false)
 	}
+	r.notify()
 }
 
 // Snapshot returns an immutable point-in-time slice of contiguous segments.
