@@ -40,6 +40,11 @@ type JobSnapshot struct {
 	Progress domain.ProgressSnapshot
 }
 
+type workerHandle struct {
+	id     string
+	retire atomic.Bool
+}
+
 // Job orchestrates probing, allocation, segment planning, and worker lifecycles.
 type Job struct {
 	deps     JobDeps
@@ -53,6 +58,19 @@ type Job struct {
 
 	segMu    sync.RWMutex
 	segments []*SegState
+	registry *Registry
+
+	workerMu         sync.Mutex
+	workers          []*workerHandle
+	workerCounter    atomic.Int64
+	workerCtx        context.Context
+	workerCancel     context.CancelFunc
+	workerWG         sync.WaitGroup
+	errCh            chan error
+	targetConns      int
+	isSingleStream   bool
+	done             bool
+	stealingDisabled bool
 
 	progress       *ProgressTracker
 	pauseRequested atomic.Bool
@@ -128,6 +146,8 @@ func (j *Job) validatorString() string {
 // Pause requests active workers to halt, syncs data, and transitions state to Paused.
 func (j *Job) Pause() []domain.Segment {
 	j.pauseRequested.Store(true)
+	j.cancelWorkers()
+
 	j.stateMu.Lock()
 	cancel := j.cancelFunc
 	j.stateMu.Unlock()
@@ -147,21 +167,26 @@ func (j *Job) Snapshot() JobSnapshot {
 	st := j.state
 	j.stateMu.RUnlock()
 
-	j.segMu.RLock()
-	segsCopy := make([]domain.Segment, len(j.segments))
-	for i, s := range j.segments {
-		segsCopy[i] = domain.Segment{
-			ID:     i,
-			Start:  s.Start,
-			End:    s.End.Load(),
-			Cursor: s.Cursor.Load(),
+	var segs []domain.Segment
+	if j.registry != nil {
+		segs = j.registry.Snapshot()
+	} else {
+		j.segMu.RLock()
+		segs = make([]domain.Segment, len(j.segments))
+		for i, s := range j.segments {
+			segs[i] = domain.Segment{
+				ID:     i,
+				Start:  s.Start,
+				End:    s.End.Load(),
+				Cursor: s.Cursor.Load(),
+			}
 		}
+		j.segMu.RUnlock()
 	}
-	j.segMu.RUnlock()
 
 	return JobSnapshot{
 		State:    st,
-		Segments: segsCopy,
+		Segments: segs,
 		Progress: j.progress.Snapshot(),
 	}
 }
@@ -236,6 +261,11 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 	j.segments = segs
 	j.segMu.Unlock()
 
+	j.registry = NewRegistry(segs, nil)
+	if j.stealingDisabled {
+		j.registry.SetDisabled(true)
+	}
+
 	j.setState(domain.StateDownloading)
 
 	workerCtx, workerCancel := context.WithCancel(ctx)
@@ -254,6 +284,7 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 				j.segMu.Lock()
 				j.segments = []*SegState{firstSeg}
 				j.segMu.Unlock()
+				j.registry = NewRegistry([]*SegState{firstSeg}, nil)
 
 				sErr := j.streamResponseDirect(workerCtx, firstResp.Body, firstSeg)
 				_ = firstResp.Body.Close()
@@ -271,35 +302,40 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 	}
 
 	if !isSingleStream || j.segments[0].Cursor.Load() < j.segments[0].End.Load() {
-		var wg sync.WaitGroup
-		errCh := make(chan error, len(j.segments))
-
-		for _, seg := range j.segments {
-			wg.Add(1)
-			go func(s *SegState) {
-				defer wg.Done()
-				wDeps := WorkerDeps{
-					Fetcher:        j.deps.Fetcher,
-					File:           j.file,
-					URL:            j.download.URL,
-					RequestContext: j.download.ReqCtx,
-					Validator:      j.validatorString(),
-					Clock:          j.deps.Clock,
-					RNG:            j.deps.RNG,
-					Progress:       &j.progress.downloaded,
-					Retries:        &j.retries,
-				}
-				if werr := RunSegment(workerCtx, wDeps, s); werr != nil {
-					if !errors.Is(werr, context.Canceled) {
-						errCh <- werr
-					}
-					workerCancel()
-				}
-			}(seg)
+		numWorkers := len(segs)
+		if isSingleStream {
+			numWorkers = 1
+		} else {
+			maxConns := j.download.Opts.MaxConns
+			if maxConns <= 0 {
+				maxConns = 4
+			}
+			if numWorkers > maxConns {
+				numWorkers = maxConns
+			}
 		}
 
-		wg.Wait()
-		close(errCh)
+		j.workerMu.Lock()
+		j.workerCtx = workerCtx
+		j.workerCancel = workerCancel
+		j.errCh = make(chan error, 32)
+		j.isSingleStream = isSingleStream
+		j.targetConns = numWorkers
+		j.done = false
+		j.workers = make([]*workerHandle, 0, numWorkers)
+		for i := 0; i < numWorkers; i++ {
+			h := &workerHandle{id: fmt.Sprintf("worker-%d", j.workerCounter.Add(1))}
+			j.workers = append(j.workers, h)
+			j.workerWG.Add(1)
+			go j.runWorker(workerCtx, h)
+		}
+		j.workerMu.Unlock()
+
+		j.workerWG.Wait()
+
+		j.workerMu.Lock()
+		j.done = true
+		j.workerMu.Unlock()
 
 		if j.pauseRequested.Load() || errors.Is(ctx.Err(), context.Canceled) {
 			_ = j.file.Sync()
@@ -311,8 +347,9 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 			}, ErrPaused
 		}
 
+		close(j.errCh)
 		var firstErr error
-		for werr := range errCh {
+		for werr := range j.errCh {
 			if firstErr == nil {
 				firstErr = werr
 			}
@@ -325,6 +362,14 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 				Duration:     j.now().Sub(startTime),
 				RetryCount:   j.retries.Load(),
 			}, firstErr
+		}
+	}
+
+	if j.download.TotalSize > 0 {
+		snap := j.Snapshot()
+		if err := domain.ValidateInvariants(snap.Segments, j.download.TotalSize); err != nil {
+			j.setState(domain.StateFailed)
+			return Result{}, fmt.Errorf("invariant violation: %w", err)
 		}
 	}
 
@@ -381,4 +426,141 @@ func (j *Job) streamResponseDirect(ctx context.Context, body io.Reader, seg *Seg
 		}
 	}
 	return nil
+}
+
+func (j *Job) runWorker(ctx context.Context, h *workerHandle) {
+	defer j.workerWG.Done()
+	defer j.removeWorker(h)
+
+	for {
+		if ctx.Err() != nil || h.retire.Load() {
+			return
+		}
+
+		seg, ok := j.registry.Claim(h.id)
+		if !ok {
+			return
+		}
+
+		wDeps := WorkerDeps{
+			Fetcher:        j.deps.Fetcher,
+			File:           j.file,
+			URL:            j.download.URL,
+			RequestContext: j.download.ReqCtx,
+			Validator:      j.validatorString(),
+			Clock:          j.deps.Clock,
+			RNG:            j.deps.RNG,
+			Progress:       &j.progress.downloaded,
+			Retries:        &j.retries,
+			Retire:         &h.retire,
+		}
+
+		werr := RunSegment(ctx, wDeps, seg)
+		if werr != nil {
+			if errors.Is(werr, ErrWorkerRetired) {
+				j.registry.Orphan(seg)
+				return
+			}
+			if !errors.Is(werr, context.Canceled) {
+				select {
+				case j.errCh <- werr:
+				default:
+				}
+			}
+			j.cancelWorkers()
+			return
+		}
+
+		if h.retire.Load() && !seg.IsComplete() {
+			j.registry.Orphan(seg)
+			return
+		}
+
+		j.registry.Release(seg)
+	}
+}
+
+func (j *Job) removeWorker(h *workerHandle) {
+	j.workerMu.Lock()
+	defer j.workerMu.Unlock()
+	for i, w := range j.workers {
+		if w == h {
+			j.workers = append(j.workers[:i], j.workers[i+1:]...)
+			break
+		}
+	}
+}
+
+func (j *Job) cancelWorkers() {
+	j.workerMu.Lock()
+	cancel := j.workerCancel
+	j.workerMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// SetTargetConns dynamically adjusts the desired number of worker connections.
+func (j *Job) SetTargetConns(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	if n > 32 {
+		n = 32
+	}
+
+	j.workerMu.Lock()
+	defer j.workerMu.Unlock()
+
+	j.targetConns = n
+
+	if j.done || j.State() != domain.StateDownloading || j.workerCancel == nil || j.isSingleStream {
+		return
+	}
+
+	activeCount := 0
+	var activeWorkers []*workerHandle
+	for _, w := range j.workers {
+		if !w.retire.Load() {
+			activeCount++
+			activeWorkers = append(activeWorkers, w)
+		}
+	}
+
+	if n > activeCount {
+		toSpawn := n - activeCount
+		for i := 0; i < toSpawn; i++ {
+			h := &workerHandle{id: fmt.Sprintf("worker-%d", j.workerCounter.Add(1))}
+			j.workers = append(j.workers, h)
+			j.workerWG.Add(1)
+			go j.runWorker(j.workerCtx, h)
+		}
+	} else if n < activeCount {
+		toRetire := activeCount - n
+		for i := len(activeWorkers) - 1; i >= 0 && toRetire > 0; i-- {
+			activeWorkers[i].retire.Store(true)
+			toRetire--
+		}
+	}
+}
+
+// SetDisableStealing configures whether idle workers attempt to steal segments.
+func (j *Job) SetDisableStealing(b bool) {
+	j.stealingDisabled = b
+	if j.registry != nil {
+		j.registry.SetDisabled(b)
+	}
+}
+
+// SplitCount returns the count of dynamic chunk splits performed by the job.
+func (j *Job) SplitCount() int64 {
+	if j.registry != nil {
+		return j.registry.SplitCount()
+	}
+	return 0
+}
+
+// Registry returns the job's underlying segment registry.
+func (j *Job) Registry() *Registry {
+	return j.registry
 }

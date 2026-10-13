@@ -1,6 +1,9 @@
 package testserver
 
-import "time"
+import (
+	"net/http"
+	"time"
+)
 
 // ETagType defines the format of the ETag header.
 type ETagType int
@@ -40,6 +43,9 @@ type config struct {
 	oneTimeToken       bool
 	mutateETagAfter    int64
 	maxConns           int
+	slowConnIndex      int
+	slowConnBPS        int64
+	requestThrottle    func(reqIndex int, r *http.Request) int64
 }
 
 func defaultConfig() config {
@@ -49,6 +55,7 @@ func defaultConfig() config {
 		ranges:          true,
 		etagType:        ETagStrong,
 		dropProbability: 1.0,
+		slowConnIndex:   -1,
 	}
 }
 
@@ -166,4 +173,19 @@ func WithMutateETagAfter(bytes int64) Option {
 // WithMaxConns limits concurrent requests, returning 429 when concurrency exceeds n.
 func WithMaxConns(n int) Option {
 	return func(c *config) { c.maxConns = n }
+}
+
+// WithSlowConn throttles transmission for the specified request/connection index to n bytes per second.
+func WithSlowConn(connIndex int, n int64) Option {
+	return func(c *config) {
+		c.slowConnIndex = connIndex
+		c.slowConnBPS = n
+	}
+}
+
+// WithRequestThrottle dynamically calculates per-request transmission speed in bytes per second.
+func WithRequestThrottle(fn func(reqIndex int, r *http.Request) int64) Option {
+	return func(c *config) {
+		c.requestThrottle = fn
+	}
 }

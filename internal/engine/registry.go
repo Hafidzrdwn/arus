@@ -8,6 +8,7 @@ type SegState struct {
 	Start  int64
 	End    atomic.Int64
 	Cursor atomic.Int64
+	active atomic.Bool
 }
 
 // NewSegState constructs an initialized SegState.
@@ -33,4 +34,9 @@ func (s *SegState) Remaining() int64 {
 // IsComplete returns true when the segment cursor reaches or passes the end offset.
 func (s *SegState) IsComplete() bool {
 	return s.Cursor.Load() >= s.End.Load()
+}
+
+// IsActive reports whether the segment is currently being processed by a worker.
+func (s *SegState) IsActive() bool {
+	return s.active.Load()
 }

@@ -4,6 +4,7 @@ import (
 	"arus/internal/app/ports"
 	"arus/internal/domain"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -13,6 +14,9 @@ import (
 	"sync/atomic"
 )
 
+// ErrWorkerRetired indicates the worker stopped because it was marked to retire.
+var ErrWorkerRetired = errors.New("worker retired")
+
 var bufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, bufferSize)
@@ -21,7 +25,9 @@ var bufPool = sync.Pool{
 }
 
 const (
-	bufferSize  = 256 * 1024
+	// BufferSize is the default buffer size used for streaming data.
+	BufferSize  = 256 * 1024
+	bufferSize  = BufferSize
 	coalesceMin = 128 * 1024
 	maxAttempts = 8
 )
@@ -37,6 +43,7 @@ type WorkerDeps struct {
 	RNG            func() float64
 	Progress       *atomic.Int64
 	Retries        *atomic.Int64
+	Retire         *atomic.Bool
 }
 
 // RunSegment downloads a discrete byte range from the remote server and writes it directly to disk.
@@ -51,6 +58,9 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if deps.Retire != nil && deps.Retire.Load() {
+			return ErrWorkerRetired
 		}
 
 		pos := seg.Cursor.Load()
@@ -147,6 +157,10 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 				_ = resp.Body.Close()
 				return ctx.Err()
 			}
+			if deps.Retire != nil && deps.Retire.Load() {
+				_ = resp.Body.Close()
+				return ErrWorkerRetired
+			}
 
 			limit := seg.End.Load()
 			if pos >= limit {
@@ -169,6 +183,11 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 					deps.Progress.Add(int64(wn))
 				}
 				bytesReadInAttempt += int64(wn)
+			}
+
+			if deps.Retire != nil && deps.Retire.Load() {
+				_ = resp.Body.Close()
+				return ErrWorkerRetired
 			}
 
 			if pos >= seg.End.Load() {

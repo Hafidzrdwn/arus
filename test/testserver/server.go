@@ -35,6 +35,7 @@ type Server struct {
 	mu         sync.Mutex
 	usedTokens map[string]bool
 	failCount  int
+	reqIndex   int
 }
 
 // New creates and starts a test HTTP server configured with options.
@@ -106,6 +107,11 @@ func (s *Server) Stats() Stats {
 }
 
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	reqIdx := s.reqIndex
+	s.reqIndex++
+	s.mu.Unlock()
+
 	s.stats.recordRequest(r)
 	defer s.stats.releaseConn()
 
@@ -230,12 +236,22 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	totalSize := s.cfg.size
 
+	connBPS := s.cfg.perConnBPS
+	if s.cfg.slowConnIndex >= 0 && reqIdx == s.cfg.slowConnIndex && s.cfg.slowConnBPS > 0 {
+		connBPS = s.cfg.slowConnBPS
+	}
+	if s.cfg.requestThrottle != nil {
+		if tbps := s.cfg.requestThrottle(reqIdx, r); tbps > 0 {
+			connBPS = tbps
+		}
+	}
+
 	if rangeHeader == "" || s.cfg.gzip || s.cfg.chunkedNoLength {
 		if !s.cfg.chunkedNoLength && !s.cfg.gzip {
 			w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
 		}
 		w.WriteHeader(http.StatusOK)
-		s.streamPayload(w, r, 0, totalSize)
+		s.streamPayload(w, r, 0, totalSize, connBPS)
 		return
 	}
 
@@ -251,10 +267,10 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.FormatInt(rangeLen, 10))
 	w.WriteHeader(http.StatusPartialContent)
 
-	s.streamPayload(w, r, start, rangeLen)
+	s.streamPayload(w, r, start, rangeLen, connBPS)
 }
 
-func (s *Server) streamPayload(w http.ResponseWriter, r *http.Request, start, length int64) {
+func (s *Server) streamPayload(w http.ResponseWriter, r *http.Request, start, length, connBPS int64) {
 	ctx := r.Context()
 	var dest io.Writer = w
 
@@ -267,15 +283,15 @@ func (s *Server) streamPayload(w http.ResponseWriter, r *http.Request, start, le
 
 	chunkSize := int64(16 * 1024)
 	var connLimiter *rate.Limiter
-	if s.cfg.perConnBPS > 0 {
+	if connBPS > 0 {
 		burst := int(chunkSize)
-		if int64(burst) > s.cfg.perConnBPS {
-			burst = int(s.cfg.perConnBPS)
+		if int64(burst) > connBPS {
+			burst = int(connBPS)
 		}
 		if burst <= 0 {
 			burst = 1024
 		}
-		connLimiter = rate.NewLimiter(rate.Limit(s.cfg.perConnBPS), burst)
+		connLimiter = rate.NewLimiter(rate.Limit(connBPS), burst)
 		connLimiter.AllowN(time.Now(), burst)
 		if int64(burst) < chunkSize {
 			chunkSize = int64(burst)
