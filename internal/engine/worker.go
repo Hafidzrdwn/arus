@@ -44,6 +44,7 @@ type WorkerDeps struct {
 	Progress       *atomic.Int64
 	Retries        *atomic.Int64
 	Retire         *atomic.Bool
+	Limiter        *LimiterSet
 }
 
 // RunSegment downloads a discrete byte range from the remote server and writes it directly to disk.
@@ -172,6 +173,12 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 
 			rn, rerr := io.ReadAtLeast(resp.Body, buf[:n], int(targetRead))
 			if rn > 0 {
+				if deps.Limiter != nil {
+					if lerr := deps.Limiter.WaitN(ctx, rn); lerr != nil {
+						_ = resp.Body.Close()
+						return lerr
+					}
+				}
 				wn, werr := deps.File.WriteAt(buf[:rn], pos)
 				if werr != nil {
 					_ = resp.Body.Close()

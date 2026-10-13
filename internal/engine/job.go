@@ -20,10 +20,11 @@ var ErrPaused = errors.New("download paused")
 
 // JobDeps bundles driven ports needed to orchestrate download jobs.
 type JobDeps struct {
-	Fetcher   ports.Fetcher
-	FileStore ports.FileStore
-	Clock     ports.Clock
-	RNG       func() float64
+	Fetcher       ports.Fetcher
+	FileStore     ports.FileStore
+	Clock         ports.Clock
+	RNG           func() float64
+	GlobalLimiter *Throttle
 }
 
 // Result summarizes execution metrics of a download job.
@@ -76,16 +77,21 @@ type Job struct {
 	pauseRequested atomic.Bool
 	retries        atomic.Int64
 	file           ports.File
+	limiter        *LimiterSet
 }
 
 // NewJob creates an initialized download Job for the given download entity.
 func NewJob(deps JobDeps, download domain.Download) *Job {
+	jobThrottle := NewThrottle(download.Opts.SpeedLimitBps)
+	limiterSet := NewLimiterSet(deps.GlobalLimiter, jobThrottle)
+
 	return &Job{
 		deps:      deps,
 		download:  download,
 		state:     domain.StateQueued,
 		progress:  NewProgressTracker(download.TotalSize, deps.Clock),
 		onStateCh: make(chan domain.State, 16),
+		limiter:   limiterSet,
 	}
 }
 
@@ -409,6 +415,11 @@ func (j *Job) streamResponseDirect(ctx context.Context, body io.Reader, seg *Seg
 		n := min(int64(len(buf)), limit-pos)
 		rn, rerr := body.Read(buf[:n])
 		if rn > 0 {
+			if j.limiter != nil {
+				if lerr := j.limiter.WaitN(ctx, rn); lerr != nil {
+					return lerr
+				}
+			}
 			wn, werr := j.file.WriteAt(buf[:rn], pos)
 			if werr != nil {
 				return ClassifyDiskError(werr)
@@ -453,6 +464,7 @@ func (j *Job) runWorker(ctx context.Context, h *workerHandle) {
 			Progress:       &j.progress.downloaded,
 			Retries:        &j.retries,
 			Retire:         &h.retire,
+			Limiter:        j.limiter,
 		}
 
 		werr := RunSegment(ctx, wDeps, seg)
@@ -563,4 +575,16 @@ func (j *Job) SplitCount() int64 {
 // Registry returns the job's underlying segment registry.
 func (j *Job) Registry() *Registry {
 	return j.registry
+}
+
+// SetSpeedLimit dynamically updates the job's download speed limit in bytes per second.
+func (j *Job) SetSpeedLimit(bps int64) {
+	if j.limiter != nil {
+		j.limiter.SetJobLimit(bps)
+	}
+}
+
+// Limiter returns the job's LimiterSet.
+func (j *Job) Limiter() *LimiterSet {
+	return j.limiter
 }
