@@ -68,9 +68,15 @@ func (f *HTTPFetcher) Probe(ctx context.Context, rc domain.RequestContext, targe
 		return domain.ProbeResult{}, err
 	}
 
-	jar, err := BuildCookieJar(rc, currentURL)
-	if err != nil {
-		return domain.ProbeResult{}, fmt.Errorf("failed to build cookie jar: %w", err)
+	var jar http.CookieJar
+	if rc.Jar != nil {
+		jar = rc.Jar
+	} else {
+		var jerr error
+		jar, jerr = BuildCookieJar(rc, currentURL)
+		if jerr != nil {
+			return domain.ProbeResult{}, fmt.Errorf("failed to build cookie jar: %w", jerr)
+		}
 	}
 
 	client := &http.Client{
@@ -104,6 +110,7 @@ func (f *HTTPFetcher) Probe(ctx context.Context, rc domain.RequestContext, targe
 		if err != nil {
 			return domain.ProbeResult{}, fmt.Errorf("probe request failed: %w", err)
 		}
+		UpdateJarFromResponse(jar, currentURL, resp.Header)
 
 		if isRedirect(resp.StatusCode) {
 			redirectHops++
@@ -203,6 +210,7 @@ func (f *HTTPFetcher) Probe(ctx context.Context, rc domain.RequestContext, targe
 		ContentType: contentType,
 		FinalURL:    currentURL.String(),
 		Warnings:    warnings,
+		Jar:         jar,
 	}, nil
 }
 
@@ -213,14 +221,29 @@ func (f *HTTPFetcher) OpenRange(ctx context.Context, rc domain.RequestContext, t
 		return ports.RangeResponse{}, err
 	}
 
-	jar, err := BuildCookieJar(rc, currentURL)
-	if err != nil {
-		return ports.RangeResponse{}, fmt.Errorf("failed to build cookie jar: %w", err)
+	var jar http.CookieJar
+	if rc.Jar != nil {
+		jar = rc.Jar
+	} else {
+		var jerr error
+		jar, jerr = BuildCookieJar(rc, currentURL)
+		if jerr != nil {
+			return ports.RangeResponse{}, fmt.Errorf("failed to build cookie jar: %w", jerr)
+		}
 	}
 
 	client := &http.Client{
 		Transport: f.transport,
 		Jar:       jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= f.maxRedirects {
+				return fmt.Errorf("stopped after %d redirects", f.maxRedirects)
+			}
+			if len(via) > 0 {
+				StripHeadersOnCrossHost(req, via[len(via)-1].URL, req.URL)
+			}
+			return nil
+		},
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, currentURL.String(), nil)
@@ -241,6 +264,7 @@ func (f *HTTPFetcher) OpenRange(ctx context.Context, rc domain.RequestContext, t
 	if err != nil {
 		return ports.RangeResponse{}, fmt.Errorf("range request failed: %w", err)
 	}
+	UpdateJarFromResponse(jar, req.URL, resp.Header)
 
 	var retryAfter time.Duration
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
@@ -258,6 +282,7 @@ func (f *HTTPFetcher) OpenRange(ctx context.Context, rc domain.RequestContext, t
 		Body:         wrappedBody,
 		Status:       resp.StatusCode,
 		ContentRange: cr,
+		ContentType:  resp.Header.Get("Content-Type"),
 		RetryAfter:   retryAfter,
 	}, nil
 }

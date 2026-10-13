@@ -18,6 +18,9 @@ import (
 // ErrPaused indicates the download job was paused by request.
 var ErrPaused = errors.New("download paused")
 
+// ErrSourceMismatch indicates the updated source URL does not match the original file metadata.
+var ErrSourceMismatch = errors.New("source mismatch: size or validator differs")
+
 // JobDeps bundles driven ports needed to orchestrate download jobs.
 type JobDeps struct {
 	Fetcher       ports.Fetcher
@@ -92,10 +95,15 @@ func NewJob(deps JobDeps, download domain.Download) *Job {
 	jobThrottle := NewThrottle(download.Opts.SpeedLimitBps)
 	limiterSet := NewLimiterSet(deps.GlobalLimiter, jobThrottle)
 
+	st := domain.StateQueued
+	if download.State != "" {
+		st = download.State
+	}
+
 	return &Job{
 		deps:       deps,
 		download:   download,
-		state:      domain.StateQueued,
+		state:      st,
 		progress:   NewProgressTracker(download.TotalSize, deps.Clock),
 		onStateCh:  make(chan domain.State, 16),
 		limiter:    limiterSet,
@@ -212,8 +220,18 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 	j.setState(domain.StateProbing)
 	probeResult, err := j.deps.Fetcher.Probe(ctx, j.download.ReqCtx, j.download.URL)
 	if err != nil {
+		var de *domain.DownloadError
+		if errors.As(err, &de) {
+			j.download.Err = de
+		} else {
+			j.download.Err = domain.NewDownloadError(domain.ErrCodeNetwork, err.Error(), true)
+		}
 		j.setState(domain.StateFailed)
 		return Result{}, fmt.Errorf("probe failed: %w", err)
+	}
+
+	if j.download.ReqCtx.Jar == nil && probeResult.Jar != nil {
+		j.download.ReqCtx.Jar = probeResult.Jar
 	}
 
 	if probeResult.FinalURL != "" {
@@ -235,11 +253,29 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 		allocMode = domain.AllocModeNone
 	}
 
-	allocSize := max(0, j.download.TotalSize)
-	file, err := j.deps.FileStore.Create(j.download.PartPath, allocSize, allocMode)
-	if err != nil {
-		j.setState(domain.StateFailed)
-		return Result{}, fmt.Errorf("file allocation failed: %w", err)
+	j.segMu.RLock()
+	isResume := len(j.segments) > 0
+	j.segMu.RUnlock()
+
+	var file ports.File
+	if isResume {
+		file, err = j.deps.FileStore.Open(j.download.PartPath)
+		if err != nil {
+			allocSize := max(0, j.download.TotalSize)
+			file, err = j.deps.FileStore.Create(j.download.PartPath, allocSize, allocMode)
+			if err != nil {
+				j.setState(domain.StateFailed)
+				return Result{}, fmt.Errorf("file allocation failed: %w", err)
+			}
+			isResume = false
+		}
+	} else {
+		allocSize := max(0, j.download.TotalSize)
+		file, err = j.deps.FileStore.Create(j.download.PartPath, allocSize, allocMode)
+		if err != nil {
+			j.setState(domain.StateFailed)
+			return Result{}, fmt.Errorf("file allocation failed: %w", err)
+		}
 	}
 	j.file = file
 	defer func() {
@@ -249,7 +285,22 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 	isSingleStream := false
 	var segs []*SegState
 
-	if j.download.TotalSize <= 0 || j.download.RangeSupport == domain.RangeSupportNo {
+	switch {
+	case isResume:
+		j.segMu.RLock()
+		segs = j.segments
+		j.segMu.RUnlock()
+
+		totalDownloaded := int64(0)
+		for _, s := range segs {
+			s.active.Store(false)
+			totalDownloaded += s.Cursor.Load() - s.Start
+		}
+		j.progress.downloaded.Store(totalDownloaded)
+		if len(segs) == 1 && (j.download.TotalSize <= 0 || j.download.RangeSupport == domain.RangeSupportNo) {
+			isSingleStream = true
+		}
+	case j.download.TotalSize <= 0 || j.download.RangeSupport == domain.RangeSupportNo:
 		isSingleStream = true
 		end := int64(math.MaxInt64)
 		if j.download.TotalSize > 0 {
@@ -258,7 +309,7 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 		segs = []*SegState{
 			NewSegState("seg-0", 0, end, 0),
 		}
-	} else {
+	default:
 		maxConns := j.download.Opts.MaxConns
 		if maxConns <= 0 {
 			maxConns = 4
@@ -295,7 +346,7 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 	j.stateMu.Unlock()
 	defer workerCancel()
 
-	if !isSingleStream && j.download.RangeSupport == domain.RangeSupportUnverified && len(segs) > 1 {
+	if !isResume && !isSingleStream && j.download.RangeSupport == domain.RangeSupportUnverified && len(segs) > 1 {
 		firstSeg := segs[0]
 		firstResp, rerr := j.deps.Fetcher.OpenRange(workerCtx, j.download.ReqCtx, j.download.URL, firstSeg.Cursor.Load(), firstSeg.End.Load()-1, j.validatorString())
 		if rerr == nil {
@@ -412,6 +463,12 @@ func (j *Job) Run(ctx context.Context) (Result, error) {
 		}
 
 		if firstErr != nil {
+			var de *domain.DownloadError
+			if errors.As(firstErr, &de) {
+				j.download.Err = de
+			} else {
+				j.download.Err = domain.NewDownloadError(domain.ErrCodeNetwork, firstErr.Error(), false)
+			}
 			j.setState(domain.StateFailed)
 			return Result{
 				BytesWritten: j.progress.Downloaded(),
@@ -781,4 +838,83 @@ func (j *Job) SetSpeedLimit(bps int64) {
 // Limiter returns the job's LimiterSet.
 func (j *Job) Limiter() *LimiterSet {
 	return j.limiter
+}
+
+// Download returns the current download entity model.
+func (j *Job) Download() domain.Download {
+	j.stateMu.RLock()
+	d := j.download
+	d.State = j.state
+	j.stateMu.RUnlock()
+	return d
+}
+
+// UpdateSource refreshes the download source URL and session context, probing and resuming from existing cursors.
+func (j *Job) UpdateSource(newURL string, rc domain.RequestContext) error {
+	j.stateMu.Lock()
+	if j.state != domain.StateFailed && j.state != domain.StatePaused {
+		j.stateMu.Unlock()
+		return fmt.Errorf("cannot update source in state %s (expected failed or paused)", j.state)
+	}
+	j.stateMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	probeResult, err := j.deps.Fetcher.Probe(ctx, rc, newURL)
+	if err != nil {
+		return fmt.Errorf("probe failed for updated source: %w", err)
+	}
+
+	if j.download.TotalSize > 0 && probeResult.TotalSize > 0 && probeResult.TotalSize != j.download.TotalSize {
+		return ErrSourceMismatch
+	}
+
+	cleanETag := func(s string) string {
+		s = strings.TrimSpace(s)
+		s = strings.TrimPrefix(s, "W/")
+		return strings.Trim(s, `"`)
+	}
+
+	oldETag := cleanETag(j.download.Validators.ETag)
+	newETag := cleanETag(probeResult.Validators.ETag)
+	if oldETag != "" && newETag != "" && oldETag != newETag {
+		return ErrSourceMismatch
+	}
+
+	oldLM := strings.TrimSpace(j.download.Validators.LastModified)
+	newLM := strings.TrimSpace(probeResult.Validators.LastModified)
+	if oldLM != "" && newLM != "" && oldLM != newLM {
+		return ErrSourceMismatch
+	}
+
+	j.download.URL = newURL
+	if probeResult.FinalURL != "" {
+		j.download.FinalURL = probeResult.FinalURL
+	} else {
+		j.download.FinalURL = newURL
+	}
+	if probeResult.Validators.ETag != "" || probeResult.Validators.LastModified != "" {
+		j.download.Validators = probeResult.Validators
+	}
+	if rc.Jar != nil {
+		j.download.ReqCtx.Jar = rc.Jar
+	}
+	j.download.ReqCtx.Method = rc.Method
+	j.download.ReqCtx.Headers = rc.Headers
+	j.download.ReqCtx.Referer = rc.Referer
+	j.download.ReqCtx.UserAgent = rc.UserAgent
+	j.download.ReqCtx.Cookies = rc.Cookies
+	j.download.ReqCtx.RawCookie = rc.RawCookie
+	j.download.ReqCtx.CookieScopeHost = rc.CookieScopeHost
+	j.download.Err = nil
+
+	j.pauseRequested.Store(false)
+	j.retries.Store(0)
+	if j.errTracker != nil {
+		j.errTracker = &ErrorTracker{}
+	}
+
+	j.setState(domain.StateProbing)
+	return nil
 }

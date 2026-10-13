@@ -10,6 +10,8 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -110,6 +112,24 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 				return fmt.Errorf("segment %s failed after %d attempts: %w", seg.ID, attempt, err)
 			}
 			delay := CalculateBackoff(attempt, 0, deps.RNG)
+			if serr := Sleep(ctx, deps.Clock, delay); serr != nil {
+				return serr
+			}
+			continue
+		}
+
+		if (resp.Status == http.StatusOK || resp.Status == http.StatusPartialContent) &&
+			strings.Contains(strings.ToLower(resp.ContentType), "text/html") && (pos > 0 || hasBinaryURL(deps.URL)) {
+			_ = resp.Body.Close()
+			if expiredRetries >= 2 {
+				return domain.NewDownloadError(domain.ErrCodeLinkExpired, "server returned text/html for binary request", true)
+			}
+			expiredRetries++
+			attempt++
+			if deps.Retries != nil {
+				deps.Retries.Add(1)
+			}
+			delay := CalculateBackoff(attempt, resp.RetryAfter, deps.RNG)
 			if serr := Sleep(ctx, deps.Clock, delay); serr != nil {
 				return serr
 			}
@@ -281,4 +301,19 @@ func RunSegment(ctx context.Context, deps WorkerDeps, seg *SegState) error {
 			return serr
 		}
 	}
+}
+
+func hasBinaryURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(u.Path))
+	switch ext {
+	case ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso", ".dmg", ".bin",
+		".exe", ".msi", ".apk", ".deb", ".rpm", ".pdf", ".mp4", ".mkv", ".avi", ".mov",
+		".mp3", ".wav", ".flac", ".docx", ".xlsx", ".pptx":
+		return true
+	}
+	return false
 }

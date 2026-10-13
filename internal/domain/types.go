@@ -86,16 +86,17 @@ type Cookie struct {
 
 // RequestContext holds captured browser session parameters.
 type RequestContext struct {
-	Method          string        `json:"method"`
-	Headers         http.Header   `json:"headers"`
-	Referer         string        `json:"referer"`
-	UserAgent       string        `json:"user_agent"`
-	Cookies         []Cookie      `json:"cookies"`
-	RawCookie       string        `json:"raw_cookie"`
-	CookieScopeHost string        `json:"cookie_scope_host"`
-	Body            []byte        `json:"body"`
-	Origin          CaptureOrigin `json:"origin"`
-	CapturedAt      time.Time     `json:"captured_at"`
+	Method          string         `json:"method"`
+	Headers         http.Header    `json:"headers"`
+	Referer         string         `json:"referer"`
+	UserAgent       string         `json:"user_agent"`
+	Cookies         []Cookie       `json:"cookies"`
+	RawCookie       string         `json:"raw_cookie"`
+	CookieScopeHost string         `json:"cookie_scope_host"`
+	Body            []byte         `json:"body"`
+	Origin          CaptureOrigin  `json:"origin"`
+	CapturedAt      time.Time      `json:"captured_at"`
+	Jar             http.CookieJar `json:"-"`
 }
 
 // Download is the central aggregate entity representing a download item.
@@ -128,11 +129,12 @@ type ContentRange struct {
 
 // ProbeResult holds the outcome of probing an origin URL.
 type ProbeResult struct {
-	RangeSupport RangeSupport `json:"range_support"`
-	TotalSize    int64        `json:"total_size"`
-	Validators   Validators   `json:"validators"`
-	FileName     string       `json:"file_name"`
-	ContentType  string       `json:"content_type"`
-	FinalURL     string       `json:"final_url"`
-	Warnings     []string     `json:"warnings"`
+	RangeSupport RangeSupport   `json:"range_support"`
+	TotalSize    int64          `json:"total_size"`
+	Validators   Validators     `json:"validators"`
+	FileName     string         `json:"file_name"`
+	ContentType  string         `json:"content_type"`
+	FinalURL     string         `json:"final_url"`
+	Warnings     []string       `json:"warnings"`
+	Jar          http.CookieJar `json:"-"`
 }

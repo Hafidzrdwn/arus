@@ -17,6 +17,8 @@ type RangeResponse struct {
 	ContentRange domain.ContentRange
 	// RetryAfter is parsed from 429/503 headers when throttling is requested.
 	RetryAfter time.Duration
+	// ContentType carries the Content-Type response header.
+	ContentType string
 }
 
 // Fetcher defines the outbound driven port for HTTP discovery and byte range downloading.

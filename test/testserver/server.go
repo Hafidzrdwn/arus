@@ -315,6 +315,16 @@ func (s *Server) streamPayload(w http.ResponseWriter, r *http.Request, start, le
 		default:
 		}
 
+		if s.cfg.expireAfter > 0 && time.Since(s.startTime) >= s.cfg.expireAfter {
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					_ = conn.Close()
+					return
+				}
+			}
+			return
+		}
+
 		toRead := chunkSize
 		if length-written < toRead {
 			toRead = length - written

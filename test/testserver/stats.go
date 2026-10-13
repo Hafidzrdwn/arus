@@ -10,6 +10,7 @@ type Stats struct {
 	TotalRequests   int64
 	ActiveConns     int64
 	MaxConnsSeen    int64
+	TotalBytesSent  int64
 	RangesRequested []string
 	HeadersReceived []http.Header
 }
@@ -81,6 +82,7 @@ func (s *statsTracker) snapshot() Stats {
 		TotalRequests:   s.totalRequests,
 		ActiveConns:     s.activeConns,
 		MaxConnsSeen:    s.maxConnsSeen,
+		TotalBytesSent:  s.totalBytesSent,
 		RangesRequested: ranges,
 		HeadersReceived: headers,
 	}

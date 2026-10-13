@@ -2,6 +2,7 @@ package httpfetch
 
 import (
 	"arus/internal/domain"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -38,7 +39,7 @@ var deniedHeaderNames = map[string]bool{
 // IsHeaderAllowed determines whether a header from RequestContext may be transmitted.
 func IsHeaderAllowed(name string) bool {
 	lower := strings.ToLower(strings.TrimSpace(name))
-	if deniedHeaderNames[lower] || strings.HasPrefix(lower, "if-") {
+	if deniedHeaderNames[lower] || strings.HasPrefix(lower, "if-") || strings.HasPrefix(lower, "sec-fetch-") {
 		return false
 	}
 	if allowedHeaderNames[lower] || strings.HasPrefix(lower, "x-") {
@@ -66,8 +67,7 @@ func ApplyRequestContext(req *http.Request, rc domain.RequestContext) {
 	}
 }
 
-// BuildCookieJar initializes an http.CookieJar populated with structured and raw cookies
-// scoped by registrable domain using publicsuffix.List.
+// BuildCookieJar initializes an http.CookieJar populated with structured and raw cookies.
 func BuildCookieJar(rc domain.RequestContext, targetURL *url.URL) (*cookiejar.Jar, error) {
 	jar, err := cookiejar.New(&cookiejar.Options{
 		PublicSuffixList: publicsuffix.List,
@@ -76,14 +76,29 @@ func BuildCookieJar(rc domain.RequestContext, targetURL *url.URL) (*cookiejar.Ja
 		return nil, err
 	}
 
+	defaultScheme := "https"
+	if targetURL != nil && targetURL.Scheme != "" {
+		defaultScheme = targetURL.Scheme
+	}
+
 	for _, c := range rc.Cookies {
 		domainStr := strings.TrimPrefix(c.Domain, ".")
 		if domainStr == "" && targetURL != nil {
 			domainStr = targetURL.Hostname()
 		}
 
+		scheme := defaultScheme
+		if c.Secure {
+			scheme = "https"
+		}
+
+		cookieDomain := domainStr
+		if net.ParseIP(domainStr) != nil || domainStr == "localhost" {
+			cookieDomain = ""
+		}
+
 		u := &url.URL{
-			Scheme: "https",
+			Scheme: scheme,
 			Host:   domainStr,
 			Path:   c.Path,
 		}
@@ -95,7 +110,7 @@ func BuildCookieJar(rc domain.RequestContext, targetURL *url.URL) (*cookiejar.Ja
 			Name:     c.Name,
 			Value:    c.Value,
 			Path:     u.Path,
-			Domain:   domainStr,
+			Domain:   cookieDomain,
 			Expires:  c.Expires,
 			Secure:   c.Secure,
 			HttpOnly: false,
@@ -108,11 +123,21 @@ func BuildCookieJar(rc domain.RequestContext, targetURL *url.URL) (*cookiejar.Ja
 		if host == "" && targetURL != nil {
 			host = targetURL.Hostname()
 		}
-		host = strings.TrimPrefix(host, ".")
+		host = strings.TrimPrefix(strings.TrimSpace(host), ".")
 
 		if host != "" {
+			scheme := defaultScheme
+			regDomain := host
+			if eTLD, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil && eTLD != "" {
+				regDomain = eTLD
+			}
+			cookieDomain := regDomain
+			if net.ParseIP(regDomain) != nil || regDomain == "localhost" {
+				cookieDomain = ""
+			}
+
 			u := &url.URL{
-				Scheme: "https",
+				Scheme: scheme,
 				Host:   host,
 				Path:   "/",
 			}
@@ -131,7 +156,7 @@ func BuildCookieJar(rc domain.RequestContext, targetURL *url.URL) (*cookiejar.Ja
 						Name:   name,
 						Value:  val,
 						Path:   "/",
-						Domain: host,
+						Domain: cookieDomain,
 					})
 				}
 			}
@@ -144,28 +169,45 @@ func BuildCookieJar(rc domain.RequestContext, targetURL *url.URL) (*cookiejar.Ja
 	return jar, nil
 }
 
-// FilterRefererOnRedirect computes the updated Referer header for a redirect hop
-// applying the strict-origin-when-cross-origin policy.
+// UpdateJarFromResponse updates the cookie jar with Set-Cookie headers from an HTTP response.
+func UpdateJarFromResponse(jar http.CookieJar, u *url.URL, header http.Header) {
+	if jar == nil || u == nil {
+		return
+	}
+	resp := http.Response{Header: header}
+	cookies := resp.Cookies()
+	if len(cookies) > 0 {
+		jar.SetCookies(u, cookies)
+	}
+}
+
+// FilterRefererOnRedirect computes the updated Referer header for a redirect hop.
 func FilterRefererOnRedirect(originalReferer string, fromURL, toURL *url.URL) string {
 	if originalReferer == "" {
 		return ""
 	}
 
-	if fromURL.Scheme == "https" && toURL.Scheme == "http" {
+	refURL, err := url.Parse(originalReferer)
+	if err != nil {
 		return ""
 	}
 
-	if fromURL.Scheme == toURL.Scheme && fromURL.Host == toURL.Host {
+	if (refURL.Scheme == "https" || (fromURL != nil && fromURL.Scheme == "https")) && toURL.Scheme == "http" {
+		return ""
+	}
+
+	if refURL.Scheme == toURL.Scheme && refURL.Host == toURL.Host {
 		return originalReferer
 	}
 
-	return fromURL.Scheme + "://" + fromURL.Host + "/"
+	return refURL.Scheme + "://" + refURL.Host + "/"
 }
 
 // StripHeadersOnCrossHost removes sensitive headers when redirecting across distinct host origins.
 func StripHeadersOnCrossHost(req *http.Request, fromURL, toURL *url.URL) {
 	if fromURL.Hostname() != toURL.Hostname() {
 		req.Header.Del("Authorization")
+		req.Header.Del("Cookie")
 	}
 
 	if ref := req.Header.Get("Referer"); ref != "" {
